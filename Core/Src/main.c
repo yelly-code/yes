@@ -30,6 +30,7 @@
 #include"stm32f1xx_it.h"
 #include "stm32f1xx_hal.h"
 #include "i2c.h"
+#include "pid.h"
 
 /* USER CODE END Includes */
 
@@ -40,7 +41,12 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define PID_PERIOD_MS      20      /* 20ms 跑一次 = 50Hz */
+#define SERVO_STEP_DEFAULT 5       /* 串口按键默认步进 */
+#define TARGET_LIMIT       90.0f   /* 目标角度限制 ±55°（和下面的输出限幅保持一致） */
+#define PID_OUT_LIMIT      90.0f   /* PID 输出限幅：决定舵机行程 90±55 = 35~145° */
+#define SERVO_YAW_SIGN     (+1)    /* 方向反了改 -1 */
+#define SERVO_PITCH_SIGN   (+1)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -55,6 +61,10 @@
 MPU6050_t mpu6050_date;
 volatile uint8_t  rx_byte;          /* 串口接收字节，中断里写，必须 volatile */
 volatile uint32_t rx_cnt = 0;       /* 已收到的字节数，显示在 OLED 上便于排查 */
+PID_t    pid_yaw, pid_pitch;        /* 左右轴、上下轴 */
+volatile float yaw_target   = 0.0f; /* 目标：0° = 保持水平（中断里改，要 volatile） */
+volatile float pitch_target = 0.0f;
+uint32_t pid_tick     = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -156,6 +166,13 @@ int main(void)
 
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
+  //pid初始化：先小增益止荡。Kp 1.2->0.6，Ki 0.50->0.10，Kd 0.02->0.05
+  //等不再来回摆之后，再按 Kp -> Kd -> Ki 的顺序慢慢加回去
+  PID_Init(&pid_yaw,   0.9f, 0.05f, 0.00f, -PID_OUT_LIMIT, PID_OUT_LIMIT);
+  PID_Init(&pid_pitch, 0.9f, 0.05f, 0.00f, -PID_OUT_LIMIT, PID_OUT_LIMIT);
+  yaw_target   = 0.0f;
+  pitch_target = 0.0f;
+  pid_tick     = HAL_GetTick();
 
   /* 上电回中，不要停在 180°，否则舵机会一直顶在机械限位上堵转发热 */
   servo_angle[0] = 90;
@@ -174,9 +191,33 @@ int main(void)
   while (1)
   {
     MPU6050_Read_All(&hi2c1, &mpu6050_date);//读取MPU6050数据
-    OLED_ShowString(0, 0, "ROLL: ",OLED_6X8);
+
+    uint32_t now = HAL_GetTick();                     /* ② 到点才算 PID */
+    if (now - pid_tick >= PID_PERIOD_MS)
+    {
+      float dt = (now - pid_tick) / 1000.0f;
+      pid_tick = now;
+      if (dt > 0.2f) dt = 0.2f;                     /* 卡顿后防止微分爆掉 */
+
+      /* 抗饱和：上一拍输出已经顶在限幅上，就先把积分清掉，避免积分锁死 */
+      if (pid_yaw.out   >=  PID_OUT_LIMIT - 0.1f || pid_yaw.out   <= -PID_OUT_LIMIT + 0.1f) pid_yaw.integral   = 0.0f;
+      if (pid_pitch.out >=  PID_OUT_LIMIT - 0.1f || pid_pitch.out <= -PID_OUT_LIMIT + 0.1f) pid_pitch.integral = 0.0f;
+
+      float out_y = PID_Update(&pid_yaw,   yaw_target,   mpu6050_date.KalmanAngleX, dt);
+      float out_p = PID_Update(&pid_pitch, pitch_target, mpu6050_date.KalmanAngleY, dt);
+
+      /* ③ 90° 是舵机中位，PID 输出是"修正量" */
+      Servo_SetAngle((uint8_t)(90 + SERVO_YAW_SIGN   * out_y), TIM_CHANNEL_2);
+      Servo_SetAngle((uint8_t)(90 + SERVO_PITCH_SIGN * out_p), TIM_CHANNEL_4);
+
+      /* 同步给 OLED 显示，A:/B: 显示的就是真正下发的角度 */
+      servo_angle[0] = (int16_t)(90 + SERVO_YAW_SIGN   * out_y);
+      servo_angle[1] = (int16_t)(90 + SERVO_PITCH_SIGN * out_p);
+    }
+
+    OLED_ShowString(0, 0, "YAW:  ",OLED_6X8);        /* 左右轴 */
     OLED_ShowFloatNum(40,0, mpu6050_date.KalmanAngleX,2,2,OLED_6X8);
-    OLED_ShowString(0, 20, "PITCH: ",OLED_6X8);
+    OLED_ShowString(0, 20, "PITCH: ",OLED_6X8);       /* 上下轴 */
     OLED_ShowFloatNum(40,20, mpu6050_date.KalmanAngleY,2,2,OLED_6X8);
     OLED_ShowString(0, 40, "RX:",OLED_6X8);          /* 调试用：收不到数就一直显示 0 */
     OLED_ShowNum(24, 40, rx_cnt, 6, OLED_6X8);
@@ -265,11 +306,18 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         value = value * 10 + (c - '0');
         if (value > 90) value = 90;               /* 一次最多走 90°，防止手滑 */
 
-        uint8_t  step = (value == 0) ? SERVO_STEP_DEFAULT : value;   /* 发 a00 = 走默认步进 */
-        uint8_t  axis = (letter == 'a' || letter == 'd') ? 0 : 1;    /* 0=CH2/PA9  1=CH4/PA11 */
-        int16_t  dir  = (letter == 'a' || letter == 'w') ? +1 : -1;  /* a/w 加，d/s 减 */
+        /* 方案A：串口只改"目标角度"，舵机交给 PID 闭环，不再直接写舵机 */
+        float step = (value == 0) ? (float)SERVO_STEP_DEFAULT : (float)value;
 
-        Servo_Jog(axis, (int16_t)(dir * step));
+        if      (letter == 'a') yaw_target   += step;
+        else if (letter == 'd') yaw_target   -= step;
+        else if (letter == 'w') pitch_target += step;
+        else                    pitch_target -= step;   /* 's' */
+
+        if (yaw_target   >  TARGET_LIMIT) yaw_target   =  TARGET_LIMIT;
+        if (yaw_target   < -TARGET_LIMIT) yaw_target   = -TARGET_LIMIT;
+        if (pitch_target >  TARGET_LIMIT) pitch_target =  TARGET_LIMIT;
+        if (pitch_target < -TARGET_LIMIT) pitch_target = -TARGET_LIMIT;
       }
       state = 0;   /* 两位数字结束，后面的 \r\n 自然被丢掉 */
     }

@@ -181,16 +181,17 @@ void MPU6050_Read_All(I2C_HandleTypeDef *I2Cx, MPU6050_t *DataStruct)
     // Kalman angle solve
     double dt = (double)(HAL_GetTick() - timer) / 1000;
     timer = HAL_GetTick();
-    double roll;
-    double roll_sqrt = sqrt(
+    /* 左右轴（yaw）：加速度 Y 分量算倾角，再用陀螺仪 X 做卡尔曼融合 */
+    double yaw;
+    double yaw_sqrt = sqrt(
         DataStruct->Accel_X_RAW * DataStruct->Accel_X_RAW + DataStruct->Accel_Z_RAW * DataStruct->Accel_Z_RAW);
-    if (roll_sqrt != 0.0)
+    if (yaw_sqrt != 0.0)
     {
-        roll = atan(DataStruct->Accel_Y_RAW / roll_sqrt) * RAD_TO_DEG;
+        yaw = atan(DataStruct->Accel_Y_RAW / yaw_sqrt) * RAD_TO_DEG;
     }
     else
     {
-        roll = 0.0;
+        yaw = 0.0;
     }
     double pitch = atan2(-DataStruct->Accel_X_RAW, DataStruct->Accel_Z_RAW) * RAD_TO_DEG;
     if ((pitch < -90 && DataStruct->KalmanAngleY > 90) || (pitch > 90 && DataStruct->KalmanAngleY < -90))
@@ -204,7 +205,7 @@ void MPU6050_Read_All(I2C_HandleTypeDef *I2Cx, MPU6050_t *DataStruct)
     }
     if (fabs(DataStruct->KalmanAngleY) > 90)
         DataStruct->Gx = -DataStruct->Gx;
-    DataStruct->KalmanAngleX = Kalman_getAngle(&KalmanX, roll, DataStruct->Gx, dt);
+    DataStruct->KalmanAngleX = Kalman_getAngle(&KalmanX, yaw, DataStruct->Gx, dt);   /* yaw = 左右轴角度 */
 }
 
 double Kalman_getAngle(Kalman_t *Kalman, double newAngle, double newRate, double dt)

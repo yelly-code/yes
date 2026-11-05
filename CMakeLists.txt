@@ -35,7 +35,8 @@ enable_language(C ASM)
 add_executable(${CMAKE_PROJECT_NAME}
         Core/Src/mpu6050.c
         Core/Src/OLED.c
-        Core/Src/OLED_Data.c)
+        Core/Src/OLED_Data.c
+        Core/Src/pid.c)
 
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
