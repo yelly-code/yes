@@ -53,23 +53,59 @@
 /* USER CODE BEGIN PV */
 
 MPU6050_t mpu6050_date;
-uint8_t rx_byte;
+volatile uint8_t  rx_byte;          /* 串口接收字节，中断里写，必须 volatile */
+volatile uint32_t rx_cnt = 0;       /* 已收到的字节数，显示在 OLED 上便于排查 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
+
+/* a/d/w/s 后面跟 00 时使用的默认步进（度） */
+#define SERVO_STEP_DEFAULT  5
+
+/* 某个舵机方向反了，就把对应的改成 1 */
+#define SERVO_CH2_INVERT    0      /* CH2 = PA9  （a / d 控制） */
+#define SERVO_CH4_INVERT    0      /* CH4 = PA11 （w / s 控制） */
+
+/* 直接按“微秒脉宽”写 CCR。本定时器 100kHz，1 个计数 = 10us，周期 2000 = 20ms(50Hz)。
+   低于 500us 或高于 2500us 都会把舵机顶在机械限位上，表现就是嗡嗡抖/堵转发热。 */
+void Servo_SetPulse(uint16_t pulse_us, uint32_t channel)
+{
+  if (pulse_us < 500)  pulse_us = 500;
+  if (pulse_us > 2500) pulse_us = 2500;
+  __HAL_TIM_SET_COMPARE(&htim1, channel, (uint16_t)(pulse_us / 10));
+}
+
 void Servo_SetAngle(uint8_t angle, uint32_t channel)
 {
-  // 1. 限制角度范围，防止输入错误导致舵机卡死
+  // 限制角度范围，防止输入错误导致舵机卡死
   if (angle > 180) angle = 180;
 
-  // 2. 套用公式：算出比较值
-  // (2000.0 / 180.0) 其实就是 11.11
-  uint16_t ccr_value = (uint16_t)(50 + (uint32_t)angle * 200 / 180);
-  // 3. 把算出的值写入定时器寄存器，舵机就会动
-  __HAL_TIM_SET_COMPARE(&htim1, channel, ccr_value);
+  // 0° -> 0.5ms(500us)，90° -> 1.5ms(1500us)，180° -> 2.5ms(2500us)
+  Servo_SetPulse((uint16_t)(500 + (uint32_t)angle * 2000 / 180), channel);
+}
+
+/* 两个轴当前角度：[0] = CH2/PA9，[1] = CH4/PA11 */
+static int16_t servo_angle[2] = {90, 90};
+
+/* 相对转动：delta 为正 = 角度增大，为负 = 角度减小，自动限幅 0~180 */
+void Servo_Jog(uint8_t axis, int16_t delta)
+{
+#if SERVO_CH2_INVERT
+  if (axis == 0) delta = -delta;
+#endif
+#if SERVO_CH4_INVERT
+  if (axis == 1) delta = -delta;
+#endif
+
+  int16_t a = servo_angle[axis] + delta;
+  if (a < 0)   a = 0;
+  if (a > 180) a = 180;
+
+  servo_angle[axis] = a;
+  Servo_SetAngle((uint8_t)a, (axis == 0) ? TIM_CHANNEL_2 : TIM_CHANNEL_4);
 }
 /* USER CODE END PFP */
 
@@ -114,17 +150,26 @@ int main(void)
   OLED_Init();//开启OLED
   MPU6050_Init(&hi2c1);//开启MPU6050传感
 
+  /* 先写 1.5ms 的比较值，再开 PWM：避免上电第一个周期输出 0us（没脉冲）造成抖动 */
+  Servo_SetPulse(1500, TIM_CHANNEL_2);
+  Servo_SetPulse(1500, TIM_CHANNEL_4);
+
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
-  Servo_SetAngle(0,   TIM_CHANNEL_2);  HAL_Delay(1000);
-  Servo_SetAngle(90,  TIM_CHANNEL_2);  HAL_Delay(1000);
-  Servo_SetAngle(180, TIM_CHANNEL_2);  HAL_Delay(1000);
+
+  /* 上电回中，不要停在 180°，否则舵机会一直顶在机械限位上堵转发热 */
+  servo_angle[0] = 90;
+  servo_angle[1] = 90;
+  Servo_SetAngle(90, TIM_CHANNEL_2);
+  Servo_SetAngle(90, TIM_CHANNEL_4);
+
+  /* 先把上电期间可能积压的 ORE 清掉，再立刻开启串口接收（不要拖到最后） */
+  __HAL_UART_CLEAR_OREFLAG(&huart2);
+  HAL_UART_Receive_IT(&huart2, (uint8_t *)&rx_byte, 1);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
-
 
   while (1)
   {
@@ -133,6 +178,12 @@ int main(void)
     OLED_ShowFloatNum(40,0, mpu6050_date.KalmanAngleX,2,2,OLED_6X8);
     OLED_ShowString(0, 20, "PITCH: ",OLED_6X8);
     OLED_ShowFloatNum(40,20, mpu6050_date.KalmanAngleY,2,2,OLED_6X8);
+    OLED_ShowString(0, 40, "RX:",OLED_6X8);          /* 调试用：收不到数就一直显示 0 */
+    OLED_ShowNum(24, 40, rx_cnt, 6, OLED_6X8);
+    OLED_ShowString(0, 48, "A:",OLED_6X8);           /* PA9  当前角度 */
+    OLED_ShowNum(16, 48, servo_angle[0], 3, OLED_6X8);
+    OLED_ShowString(56, 48, "B:",OLED_6X8);          /* PA11 当前角度 */
+    OLED_ShowNum(72, 48, servo_angle[1], 3, OLED_6X8);
     OLED_Update();
     /* USER CODE END WHILE */
 
@@ -181,39 +232,25 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-// void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-// {
-//   // 在这里写你的业务逻辑，这里绝对安全，不会被 CubeMX 清空！
-//   if (huart->Instance == USART2) {
-//     if (SG90[0] == 'w') {
-//       Servo_SetAngle(SG90[1] - '0', TIM_CHANNEL_4);
-//     }
-//     else if (SG90[0] == 's') {
-//       Servo_SetAngle(SG90[1] - '0', TIM_CHANNEL_4);
-//     }
-//     else if (SG90[0] == 'a') {
-//   Servo_SetAngle(SG90[1] - '0', TIM_CHANNEL_2);
-//     }
-//     else if (SG90[0] == 'd') {
-//   Servo_SetAngle(SG90[1] - '0', TIM_CHANNEL_2);
-//     }
-//     HAL_UART_Receive_IT(&huart2, SG90, 2);
-//   }
-// }
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-  static uint8_t state = 0;      // 0=等字母 1=等十位 2=等个位
-  static uint8_t ch_cmd = 0;     // 保存 TIM_CHANNEL_2 / TIM_CHANNEL_4
+  static uint8_t state  = 0;     // 0=等字母 1=等十位 2=等个位
+  static uint8_t letter = 0;     // 保存 'a'/'d'/'w'/'s'
   static uint8_t value  = 0;
 
   if (huart->Instance == USART2)
   {
     uint8_t c = rx_byte;
+    rx_cnt++;
 
     if (state == 0)
     {
-      if (c == 'w' || c == 's')      { ch_cmd = TIM_CHANNEL_4; state = 1; value = 0; }
-      else if (c == 'a' || c == 'd') { ch_cmd = TIM_CHANNEL_2; state = 1; value = 0; }
+      if (c == 'a' || c == 'd' || c == 'w' || c == 's')
+      {
+        letter = c;
+        state = 1;
+        value = 0;
+      }
       /* \r \n 空格 等一律忽略 */
     }
     else if (state == 1)
@@ -226,13 +263,26 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
       if (c >= '0' && c <= '9')
       {
         value = value * 10 + (c - '0');
-        if (value > 180) value = 180;
-        Servo_SetAngle(value, ch_cmd);
+        if (value > 90) value = 90;               /* 一次最多走 90°，防止手滑 */
+
+        uint8_t  step = (value == 0) ? SERVO_STEP_DEFAULT : value;   /* 发 a00 = 走默认步进 */
+        uint8_t  axis = (letter == 'a' || letter == 'd') ? 0 : 1;    /* 0=CH2/PA9  1=CH4/PA11 */
+        int16_t  dir  = (letter == 'a' || letter == 'w') ? +1 : -1;  /* a/w 加，d/s 减 */
+
+        Servo_Jog(axis, (int16_t)(dir * step));
       }
       state = 0;   /* 两位数字结束，后面的 \r\n 自然被丢掉 */
     }
 
-    HAL_UART_Receive_IT(&huart2, &rx_byte, 1);
+    HAL_UART_Receive_IT(&huart2, (uint8_t *)&rx_byte, 1);
+  }
+}
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART2)
+  {
+    __HAL_UART_CLEAR_OREFLAG(huart);                       // 清 ORE/FE/NE
+    HAL_UART_Receive_IT(&huart2, (uint8_t *)&rx_byte, 1);  // 立刻重新开收
   }
 }
 /* USER CODE END 4 */
