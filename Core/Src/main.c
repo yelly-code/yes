@@ -27,7 +27,7 @@
 /* USER CODE BEGIN Includes */
 #include "OLED.h"
 #include "mpu6050.h"
-#include"stm32f1xx_it.h"
+#include "stm32f1xx_it.h"
 #include "stm32f1xx_hal.h"
 #include "i2c.h"
 #include "pid.h"
@@ -41,12 +41,17 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define PID_PERIOD_MS      20      /* 20ms 跑一次 = 50Hz */
-#define SERVO_STEP_DEFAULT 5       /* 串口按键默认步进 */
-#define TARGET_LIMIT       90.0f   /* 目标角度限制 ±55°（和下面的输出限幅保持一致） */
-#define PID_OUT_LIMIT      90.0f   /* PID 输出限幅：决定舵机行程 90±55 = 35~145° */
-#define SERVO_YAW_SIGN     (+1)    /* 方向反了改 -1 */
-#define SERVO_PITCH_SIGN   (+1)
+
+// ---------------- 可调参数 ----------------
+#define PID_PERIOD_MS       20      // PID 采样周期 20ms
+#define SERVO_STEP_DEFAULT  5       // 默认步进
+#define TARGET_LIMIT        45.0f   // PID 模式目标角度限幅
+#define PID_OUT_LIMIT       45.0f   // PID 输出限幅，舵机行程 = 中位 ±45°
+#define SERVO_YAW_CENTER    90      // Yaw 舵机中位
+#define SERVO_PITCH_CENTER  90      // Pitch 舵机中位
+#define SERVO_YAW_SIGN      (+1)    // Yaw 方向
+#define SERVO_PITCH_SIGN    (+1)    // Pitch 方向1
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -58,57 +63,49 @@
 
 /* USER CODE BEGIN PV */
 
-MPU6050_t mpu6050_date;
-volatile uint8_t  rx_byte;          /* 串口接收字节，中断里写，必须 volatile */
-volatile uint32_t rx_cnt = 0;       /* 已收到的字节数，显示在 OLED 上便于排查 */
-PID_t    pid_yaw, pid_pitch;        /* 左右轴、上下轴 */
-volatile float yaw_target   = 0.0f; /* 目标：0° = 保持水平（中断里改，要 volatile） */
+MPU6050_t mpu6050_date;                 // 融合后的姿态数据
+volatile uint8_t  rx_byte;              // 串口单字节缓冲（
+volatile uint32_t rx_cnt = 0;           //
+
+volatile uint8_t  pid_mode = 0;         // 0: 角度模式 1: PID 模式
+PID_t    pid_yaw, pid_pitch;            // 两个轴的 PID
+volatile float yaw_target   = 0.0f;     // PID 目标角度
 volatile float pitch_target = 0.0f;
-uint32_t pid_tick     = 0;
+uint32_t pid_tick = 0;                  // 上次 PID 计算时刻
+static   int16_t servo_angle[2] = {SERVO_YAW_CENTER, SERVO_PITCH_CENTER};   // 两轴当前舵机角度 [0]=PA9 [1]=PA11
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart);
+void Servo_SetPulse(uint16_t pulse_us, uint32_t channel);
+void Servo_SetAngle(uint8_t angle, uint32_t channel);
+void Servo_Jog(uint8_t axis, int16_t delta);
 
-/* a/d/w/s 后面跟 00 时使用的默认步进（度） */
-#define SERVO_STEP_DEFAULT  5
-
-/* 某个舵机方向反了，就把对应的改成 1 */
-#define SERVO_CH2_INVERT    0      /* CH2 = PA9  （a / d 控制） */
-#define SERVO_CH4_INVERT    0      /* CH4 = PA11 （w / s 控制） */
-
-/* 直接按“微秒脉宽”写 CCR。本定时器 100kHz，1 个计数 = 10us，周期 2000 = 20ms(50Hz)。
-   低于 500us 或高于 2500us 都会把舵机顶在机械限位上，表现就是嗡嗡抖/堵转发热。 */
+// 按微秒脉宽写 CCR：TIM1 计数频率 100kHz，1 个计数 = 10us，周期 2000 = 20ms(50Hz)
 void Servo_SetPulse(uint16_t pulse_us, uint32_t channel)
 {
+  // 超出 0.5~2.5ms 会把舵机顶在机械限位上堵转发热
   if (pulse_us < 500)  pulse_us = 500;
   if (pulse_us > 2500) pulse_us = 2500;
   __HAL_TIM_SET_COMPARE(&htim1, channel, (uint16_t)(pulse_us / 10));
 }
 
+// 按角度写舵机：0°->0.5ms  90°->1.5ms  180°->2.5ms
 void Servo_SetAngle(uint8_t angle, uint32_t channel)
 {
-  // 限制角度范围，防止输入错误导致舵机卡死
   if (angle > 180) angle = 180;
-
-  // 0° -> 0.5ms(500us)，90° -> 1.5ms(1500us)，180° -> 2.5ms(2500us)
   Servo_SetPulse((uint16_t)(500 + (uint32_t)angle * 2000 / 180), channel);
 }
 
-/* 两个轴当前角度：[0] = CH2/PA9，[1] = CH4/PA11 */
-static int16_t servo_angle[2] = {90, 90};
-
-/* 相对转动：delta 为正 = 角度增大，为负 = 角度减小，自动限幅 0~180 */
+// 增量转动：手动模式下由串口命令直接调用，角度自动限幅 0~180
 void Servo_Jog(uint8_t axis, int16_t delta)
 {
-#if SERVO_CH2_INVERT
-  if (axis == 0) delta = -delta;
-#endif
-#if SERVO_CH4_INVERT
-  if (axis == 1) delta = -delta;
-#endif
+  // 方向取反统一在这里做，两个模式共用 SERVO_xxx_SIGN
+  if (axis == 0) delta = (int16_t)(delta * SERVO_YAW_SIGN);
+  else           delta = (int16_t)(delta * SERVO_PITCH_SIGN);
 
   int16_t a = servo_angle[axis] + delta;
   if (a < 0)   a = 0;
@@ -157,30 +154,28 @@ int main(void)
   MX_TIM1_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-  OLED_Init();//开启OLED
-  MPU6050_Init(&hi2c1);//开启MPU6050传感
+  OLED_Init();              // 0.96 寸 OLED
+  MPU6050_Init(&hi2c1);     // 六轴陀螺仪
 
-  /* 先写 1.5ms 的比较值，再开 PWM：避免上电第一个周期输出 0us（没脉冲）造成抖动 */
+  // 避免上电第一个周期没有脉冲
   Servo_SetPulse(1500, TIM_CHANNEL_2);
   Servo_SetPulse(1500, TIM_CHANNEL_4);
-
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
-  //pid初始化：先小增益止荡。Kp 1.2->0.6，Ki 0.50->0.10，Kd 0.02->0.05
-  //等不再来回摆之后，再按 Kp -> Kd -> Ki 的顺序慢慢加回去
-  PID_Init(&pid_yaw,   0.9f, 0.05f, 0.00f, -PID_OUT_LIMIT, PID_OUT_LIMIT);
-  PID_Init(&pid_pitch, 0.9f, 0.05f, 0.00f, -PID_OUT_LIMIT, PID_OUT_LIMIT);
+
+
+  PID_Init(&pid_yaw,   0.8f, 0.05f, 0.05f, -PID_OUT_LIMIT, PID_OUT_LIMIT);
+  PID_Init(&pid_pitch, 0.8f, 0.05f, 0.05f, -PID_OUT_LIMIT, PID_OUT_LIMIT);
   yaw_target   = 0.0f;
   pitch_target = 0.0f;
   pid_tick     = HAL_GetTick();
 
-  /* 上电回中，不要停在 180°，否则舵机会一直顶在机械限位上堵转发热 */
-  servo_angle[0] = 90;
-  servo_angle[1] = 90;
-  Servo_SetAngle(90, TIM_CHANNEL_2);
-  Servo_SetAngle(90, TIM_CHANNEL_4);
+  servo_angle[0] = SERVO_YAW_CENTER;
+  servo_angle[1] = SERVO_PITCH_CENTER;
+  Servo_SetAngle(SERVO_YAW_CENTER,   TIM_CHANNEL_2);
+  Servo_SetAngle(SERVO_PITCH_CENTER, TIM_CHANNEL_4);
 
-  /* 先把上电期间可能积压的 ORE 清掉，再立刻开启串口接收（不要拖到最后） */
+
   __HAL_UART_CLEAR_OREFLAG(&huart2);
   HAL_UART_Receive_IT(&huart2, (uint8_t *)&rx_byte, 1);
   /* USER CODE END 2 */
@@ -190,41 +185,46 @@ int main(void)
 
   while (1)
   {
-    MPU6050_Read_All(&hi2c1, &mpu6050_date);//读取MPU6050数据
+    MPU6050_Read_All(&hi2c1, &mpu6050_date);   // 更新 KalmanAngleX/Y
 
-    uint32_t now = HAL_GetTick();                     /* ② 到点才算 PID */
-    if (now - pid_tick >= PID_PERIOD_MS)
+
+    uint32_t now = HAL_GetTick();
+    if (pid_mode && (now - pid_tick >= PID_PERIOD_MS))
     {
       float dt = (now - pid_tick) / 1000.0f;
       pid_tick = now;
-      if (dt > 0.2f) dt = 0.2f;                     /* 卡顿后防止微分爆掉 */
+      if (dt > 0.2f) dt = 0.2f;                // 主循环卡顿后防止微分项爆炸
 
-      /* 抗饱和：上一拍输出已经顶在限幅上，就先把积分清掉，避免积分锁死 */
+      // 抗积分饱和
       if (pid_yaw.out   >=  PID_OUT_LIMIT - 0.1f || pid_yaw.out   <= -PID_OUT_LIMIT + 0.1f) pid_yaw.integral   = 0.0f;
       if (pid_pitch.out >=  PID_OUT_LIMIT - 0.1f || pid_pitch.out <= -PID_OUT_LIMIT + 0.1f) pid_pitch.integral = 0.0f;
 
       float out_y = PID_Update(&pid_yaw,   yaw_target,   mpu6050_date.KalmanAngleX, dt);
       float out_p = PID_Update(&pid_pitch, pitch_target, mpu6050_date.KalmanAngleY, dt);
 
-      /* ③ 90° 是舵机中位，PID 输出是"修正量" */
-      Servo_SetAngle((uint8_t)(90 + SERVO_YAW_SIGN   * out_y), TIM_CHANNEL_2);
-      Servo_SetAngle((uint8_t)(90 + SERVO_PITCH_SIGN * out_p), TIM_CHANNEL_4);
+      // 舵机中位 ± PID 修正量
+      servo_angle[0] = (int16_t)(SERVO_YAW_CENTER   + SERVO_YAW_SIGN   * out_y);
+      servo_angle[1] = (int16_t)(SERVO_PITCH_CENTER + SERVO_PITCH_SIGN * out_p);
 
-      /* 同步给 OLED 显示，A:/B: 显示的就是真正下发的角度 */
-      servo_angle[0] = (int16_t)(90 + SERVO_YAW_SIGN   * out_y);
-      servo_angle[1] = (int16_t)(90 + SERVO_PITCH_SIGN * out_p);
+      Servo_SetAngle((uint8_t)servo_angle[0], TIM_CHANNEL_2);
+      Servo_SetAngle((uint8_t)servo_angle[1], TIM_CHANNEL_4);
     }
 
-    OLED_ShowString(0, 0, "YAW:  ",OLED_6X8);        /* 左右轴 */
-    OLED_ShowFloatNum(40,0, mpu6050_date.KalmanAngleX,2,2,OLED_6X8);
-    OLED_ShowString(0, 20, "PITCH: ",OLED_6X8);       /* 上下轴 */
-    OLED_ShowFloatNum(40,20, mpu6050_date.KalmanAngleY,2,2,OLED_6X8);
-    OLED_ShowString(0, 40, "RX:",OLED_6X8);          /* 调试用：收不到数就一直显示 0 */
-    OLED_ShowNum(24, 40, rx_cnt, 6, OLED_6X8);
-    OLED_ShowString(0, 48, "A:",OLED_6X8);           /* PA9  当前角度 */
-    OLED_ShowNum(16, 48, servo_angle[0], 3, OLED_6X8);
-    OLED_ShowString(56, 48, "B:",OLED_6X8);          /* PA11 当前角度 */
-    OLED_ShowNum(72, 48, servo_angle[1], 3, OLED_6X8);
+    // ---------------- OLED 显示 ----------------
+    OLED_ShowString(0, 0, "YAW:  ", OLED_6X8);
+    OLED_ShowFloatNum(40, 0, mpu6050_date.KalmanAngleX, 2, 2, OLED_6X8);
+    OLED_ShowString(0, 12, "PITCH:", OLED_6X8);
+    OLED_ShowFloatNum(40, 12, mpu6050_date.KalmanAngleY, 2, 2, OLED_6X8);
+    OLED_ShowString(0, 24, pid_mode ? "MODE:PID" : "MODE:MAN", OLED_6X8);
+    OLED_ShowString(0, 36, "A:", OLED_6X8);
+    OLED_ShowNum(16, 36, servo_angle[0], 3, OLED_6X8);
+    OLED_ShowString(56, 36, "B:", OLED_6X8);
+    OLED_ShowNum(72, 36, servo_angle[1], 3, OLED_6X8);
+    OLED_ShowString(0, 48, "T:", OLED_6X8);
+    OLED_ShowSignedNum(16, 48, (int32_t)yaw_target, 2, OLED_6X8);
+    OLED_ShowSignedNum(48, 48, (int32_t)pitch_target, 2, OLED_6X8);
+    OLED_ShowString(0, 56, "RX:", OLED_6X8);
+    OLED_ShowNum(24, 56, rx_cnt, 5, OLED_6X8);
     OLED_Update();
     /* USER CODE END WHILE */
 
@@ -273,64 +273,85 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+
+// 单独发一个小写 p 切换 PID 模式
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
-  static uint8_t state  = 0;     // 0=等字母 1=等十位 2=等个位
-  static uint8_t letter = 0;     // 保存 'a'/'d'/'w'/'s'
+  static uint8_t state  = 0;   // 0=等字母 1=等十位 2=等个位
+  static uint8_t letter = 0;
   static uint8_t value  = 0;
 
-  if (huart->Instance == USART2)
+  if (huart->Instance != USART2) return;
+
+  uint8_t c = rx_byte;
+  rx_cnt++;
+
+  if (state == 0)
   {
-    uint8_t c = rx_byte;
-    rx_cnt++;
-
-    if (state == 0)
+    if (c == 'p' || c == 'P')
     {
-      if (c == 'a' || c == 'd' || c == 'w' || c == 's')
-      {
-        letter = c;
-        state = 1;
-        value = 0;
-      }
-      /* \r \n 空格 等一律忽略 */
+      pid_mode = !pid_mode;
+      PID_Reset(&pid_yaw);      // 切模式时清掉积分
+      PID_Reset(&pid_pitch);
+      yaw_target   = 0.0f;
+      pitch_target = 0.0f;
+      pid_tick     = HAL_GetTick();
     }
-    else if (state == 1)
+    else if (c == 'a' || c == 'd' || c == 'w' || c == 's')
     {
-      if (c >= '0' && c <= '9') { value = c - '0'; state = 2; }
-      else { state = 0; }
+      letter = c;
+      value  = 0;
+      state  = 1;
     }
-    else /* state == 2 */
+  }
+  else if (state == 1)
+  {
+    if (c >= '0' && c <= '9') { value = c - '0'; state = 2; }
+    else state = 0;
+  }
+  else
+  {
+    if (c >= '0' && c <= '9')
     {
-      if (c >= '0' && c <= '9')
+      uint8_t step = (uint8_t)(value * 10 + (c - '0'));
+      if (step == 0) step = SERVO_STEP_DEFAULT;
+      if (step > 90) step = 90;
+
+      if (pid_mode)
       {
-        value = value * 10 + (c - '0');
-        if (value > 90) value = 90;               /* 一次最多走 90°，防止手滑 */
-
-        /* 方案A：串口只改"目标角度"，舵机交给 PID 闭环，不再直接写舵机 */
-        float step = (value == 0) ? (float)SERVO_STEP_DEFAULT : (float)value;
-
+        // 闭环模式：命令改的是“目标角度”，舵机由 PID 驱动
         if      (letter == 'a') yaw_target   += step;
         else if (letter == 'd') yaw_target   -= step;
         else if (letter == 'w') pitch_target += step;
-        else                    pitch_target -= step;   /* 's' */
+        else                    pitch_target -= step;
 
         if (yaw_target   >  TARGET_LIMIT) yaw_target   =  TARGET_LIMIT;
         if (yaw_target   < -TARGET_LIMIT) yaw_target   = -TARGET_LIMIT;
         if (pitch_target >  TARGET_LIMIT) pitch_target =  TARGET_LIMIT;
         if (pitch_target < -TARGET_LIMIT) pitch_target = -TARGET_LIMIT;
       }
-      state = 0;   /* 两位数字结束，后面的 \r\n 自然被丢掉 */
+      else
+      {
+        // 手动模式：命令直接增量驱动舵机，范围 0~180°
+        uint8_t axis = (letter == 'a' || letter == 'd') ? 0 : 1;
+        int16_t dir  = (letter == 'a' || letter == 'w') ? +1 : -1;
+        Servo_Jog(axis, (int16_t)(dir * step));
+      }
     }
-
-    HAL_UART_Receive_IT(&huart2, (uint8_t *)&rx_byte, 1);
+    state = 0;
   }
+
+  HAL_UART_Receive_IT(&huart2, (uint8_t *)&rx_byte, 1);
 }
+
+
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART2)
   {
-    __HAL_UART_CLEAR_OREFLAG(huart);                       // 清 ORE/FE/NE
-    HAL_UART_Receive_IT(&huart2, (uint8_t *)&rx_byte, 1);  // 立刻重新开收
+    __HAL_UART_CLEAR_OREFLAG(huart);
+    HAL_UART_Receive_IT(&huart2, (uint8_t *)&rx_byte, 1);
   }
 }
 /* USER CODE END 4 */
@@ -351,7 +372,7 @@ void Error_Handler(void)
 }
 #ifdef USE_FULL_ASSERT
 /**
-  * @brief  Reports the name of the source file and the source line number
+  * @brief  Reports the source file name and the source line number
   *         where the assert_param error has occurred.
   * @param  file: pointer to the source file name
   * @param  line: assert_param error line source number
